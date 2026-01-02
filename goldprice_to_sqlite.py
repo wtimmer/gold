@@ -71,7 +71,8 @@ def ms_to_utc_iso_bucket_start(ts_ms: int, bucket_s: int) -> str:
     ts_s = ts_ms // 1000
     start_s = (ts_s // bucket_s) * bucket_s
     dt = datetime.fromtimestamp(start_s, tz=timezone.utc)
-    return dt.isoformat(timespec="seconds")
+    # Normalize to a canonical UTC string with 'Z' (avoids ' +00:00' vs 'Z' PK mismatches)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def build_url(currency: str) -> str:

@@ -31,7 +31,7 @@ import numpy as np
 # ----------------------------
 # Configuration (no parameters)
 # ----------------------------
-DB_PATH = "goldprice.sqlite"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldprice.sqlite")
 CURRENCY = "USD"
 
 # Continuous mode
@@ -187,15 +187,20 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def read_ticks(conn: sqlite3.Connection, currency: str) -> pd.DataFrame:
-    # ticks table columns (per your DB): fetched_at_utc TEXT, ts_ms INTEGER, xau_price REAL, ...
+def read_ticks(conn: sqlite3.Connection, currency: str, since_ts_ms: Optional[int] = None) -> pd.DataFrame:
+    # ticks table columns (per your DB): fetched_at_utc TEXT, source_ts_ms INTEGER, xau_price REAL, ...
     query = """
         SELECT fetched_at_utc, source_ts_ms AS ts_ms, xau_price
         FROM ticks
         WHERE currency = ?
-        ORDER BY ts_ms ASC
     """
-    df = pd.read_sql_query(query, conn, params=(currency,))
+    params = [currency]
+    if since_ts_ms is not None:
+        query += " AND source_ts_ms >= ?"
+        params.append(int(since_ts_ms))
+    query += " ORDER BY source_ts_ms ASC"
+
+    df = pd.read_sql_query(query, conn, params=tuple(params))
     if df.empty:
         return df
 

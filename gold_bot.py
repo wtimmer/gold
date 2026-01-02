@@ -33,13 +33,14 @@ import json
 import signal
 import atexit
 import sqlite3
+import shutil
 import datetime as _dt
 from typing import Optional, Tuple, Dict, Any, List
 
 # ----------------------------
 # Fixed configuration (NO CLI)
 # ----------------------------
-DB_PATH = os.path.abspath("goldprice.sqlite")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldprice.sqlite")
 CURRENCY = "USD"
 TIMEFRAME = "1m"
 
@@ -74,6 +75,37 @@ PROWL_TIMEOUT = 15
 # ----------------------------
 def utc_now() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+
+def open_writable_db(db_path: str) -> sqlite3.Connection:
+    """
+    If DB is mounted read-only, transparently copy to a writable sibling file and use that instead.
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        # quick write test
+        conn.execute("CREATE TABLE IF NOT EXISTS __write_test (id INTEGER);")
+        conn.execute("DROP TABLE IF EXISTS __write_test;")
+        return conn
+    except sqlite3.OperationalError as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        msg = str(e).lower()
+        if "readonly" in msg or "read-only" in msg:
+            base, ext = os.path.splitext(db_path)
+            rw_path = base + "_rw" + (ext if ext else ".sqlite")
+            shutil.copy2(db_path, rw_path)
+            conn = sqlite3.connect(rw_path, timeout=30, isolation_level=None)
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA journal_mode=WAL;")
+            print(f"[WARN] Database was read-only. Working copy created: {rw_path}")
+            return conn
+        raise
 
 
 def read_prowl_key() -> Optional[str]:
@@ -212,14 +244,42 @@ CREATE TABLE IF NOT EXISTS bot_stats (
 
 
 def connect_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=30, isolation_level=None)
-    conn.execute("PRAGMA foreign_keys=ON;")
-    conn.executescript(BOT_DDL)
-    conn.execute("INSERT OR IGNORE INTO bot_stats(currency,timeframe,total_trades,wins,losses,breakevens) VALUES (?,?,?,?,?,?)",
-                 (CURRENCY, TIMEFRAME, 0, 0, 0, 0))
-    conn.execute("INSERT OR IGNORE INTO bot_last_signal(currency,timeframe,last_signal_bar_ts_ms) VALUES (?,?,?)",
-                 (CURRENCY, TIMEFRAME, 0))
-    return conn
+    # Use a writable DB (creates a working copy if original is read-only)
+    try:
+        conn = open_writable_db(path)
+        conn.executescript(BOT_DDL)
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_stats(currency,timeframe,total_trades,wins,losses,breakevens) VALUES (?,?,?,?,?,?)",
+            (CURRENCY, TIMEFRAME, 0, 0, 0, 0),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_last_signal(currency,timeframe,last_signal_bar_ts_ms) VALUES (?,?,?)",
+            (CURRENCY, TIMEFRAME, 0),
+        )
+        return conn
+    except sqlite3.OperationalError as e:
+        # Fallback: if we hit a read-only error during initialization, force a copied DB.
+        msg = str(e).lower()
+        if "readonly" in msg or "read-only" in msg:
+            base, ext = os.path.splitext(path)
+            rw_path = base + "_rw" + (ext if ext else ".sqlite")
+            shutil.copy2(path, rw_path)
+            conn = sqlite3.connect(rw_path, timeout=30, isolation_level=None)
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.executescript(BOT_DDL)
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_stats(currency,timeframe,total_trades,wins,losses,breakevens) VALUES (?,?,?,?,?,?)",
+                (CURRENCY, TIMEFRAME, 0, 0, 0, 0),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_last_signal(currency,timeframe,last_signal_bar_ts_ms) VALUES (?,?,?)",
+                (CURRENCY, TIMEFRAME, 0),
+            )
+            print(f"[WARN] DB init required writes; working copy created: {rw_path}")
+            return conn
+        raise
+
 
 
 # ----------------------------
@@ -250,9 +310,9 @@ def fetch_latest_indicator_rows(conn: sqlite3.Connection, limit: int = 50) -> Li
 def fetch_ohlc_by_ts(conn: sqlite3.Connection, ts_ms: int) -> Optional[Dict[str, Any]]:
     r = conn.execute(
         """
-        SELECT period_start_ts_ms, open, high, low, close
+        SELECT CAST(strftime('%s', period_start_utc) AS INTEGER)*1000 AS period_start_ts_ms, open, high, low, close
         FROM ohlc
-        WHERE currency=? AND timeframe=? AND period_start_ts_ms=?
+        WHERE currency=? AND timeframe=? AND CAST(strftime('%s', period_start_utc) AS INTEGER)*1000=?
         """,
         (CURRENCY, TIMEFRAME, int(ts_ms)),
     ).fetchone()
@@ -264,10 +324,10 @@ def fetch_ohlc_by_ts(conn: sqlite3.Connection, ts_ms: int) -> Optional[Dict[str,
 def fetch_new_ohlc_since(conn: sqlite3.Connection, ts_ms: int) -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT period_start_ts_ms, open, high, low, close
+        SELECT CAST(strftime('%s', period_start_utc) AS INTEGER)*1000 AS period_start_ts_ms, open, high, low, close
         FROM ohlc
-        WHERE currency=? AND timeframe=? AND period_start_ts_ms>?
-        ORDER BY period_start_ts_ms ASC
+        WHERE currency=? AND timeframe=? AND CAST(strftime('%s', period_start_utc) AS INTEGER)*1000>?
+        ORDER BY CAST(strftime('%s', period_start_utc) AS INTEGER)*1000 ASC
         """,
         (CURRENCY, TIMEFRAME, int(ts_ms)),
     ).fetchall()
@@ -685,7 +745,7 @@ def main() -> int:
     if last_bar_ts == 0:
         # initialize to latest available bar - 2 bars (avoid partial)
         r = conn.execute(
-            "SELECT MAX(period_start_ts_ms) FROM ohlc WHERE currency=? AND timeframe=?",
+            "SELECT MAX(CAST(strftime('%s', period_start_utc) AS INTEGER)*1000) FROM ohlc WHERE currency=? AND timeframe=?",
             (CURRENCY, TIMEFRAME),
         ).fetchone()
         if r and r[0]:

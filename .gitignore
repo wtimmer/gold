@@ -1,0 +1,7 @@
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+__pycache__/
+*.pyc
+.env

@@ -31,7 +31,7 @@ import numpy as np
 # ----------------------------
 # Configuration (no parameters)
 # ----------------------------
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldprice.sqlite")
+DB_PATH = "goldprice.sqlite"
 CURRENCY = "USD"
 
 # Continuous mode
@@ -45,10 +45,16 @@ TIMEFRAMES = [
     ("5m", "5min"),
     ("15m", "15min"),
     ("30m", "30min"),
-    ("1h", "1H"),
-    ("4h", "4H"),
-    ("1d", "1D"),
+    ("1h", "1h"),
+    ("4h", "4h"),
+    ("1d", "1d"),
 ]
+
+
+def normalize_pandas_freq(freq: str) -> str:
+    """Normalize pandas resample frequency strings for forward compatibility."""
+    return freq.replace("H", "h").replace("D", "d")
+
 
 # Indicator settings (fixed; no runtime params)
 SMA_PERIODS = [20, 50, 200]
@@ -188,7 +194,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
 
 
 def read_ticks(conn: sqlite3.Connection, currency: str, since_ts_ms: Optional[int] = None) -> pd.DataFrame:
-    # ticks table columns (per your DB): fetched_at_utc TEXT, source_ts_ms INTEGER, xau_price REAL, ...
+    """Read ticks for a currency. Optionally filter on source_ts_ms >= since_ts_ms."""
     query = """
         SELECT fetched_at_utc, source_ts_ms AS ts_ms, xau_price
         FROM ticks
@@ -210,6 +216,7 @@ def read_ticks(conn: sqlite3.Connection, currency: str, since_ts_ms: Optional[in
         df.loc[df["dt"].isna(), "dt"] = pd.to_datetime(df.loc[df["dt"].isna(), "ts_ms"], unit="ms", utc=True)
 
     df = df.dropna(subset=["dt", "xau_price"]).copy()
+
     # Fill missing ts_ms from dt if needed
     if "ts_ms" in df.columns:
         if df["ts_ms"].isna().any():
@@ -234,6 +241,7 @@ def rebuild_ohlc(conn: sqlite3.Connection, ticks: pd.DataFrame, currency: str) -
     price = ticks["xau_price"].astype(float)
 
     for tf_label, tf_freq in TIMEFRAMES:
+        tf_freq = normalize_pandas_freq(tf_freq)
         # Resample to OHLC
         ohlc = price.resample(tf_freq, label="left", closed="left").ohlc()
         # Remove empty bars

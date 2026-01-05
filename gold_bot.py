@@ -43,10 +43,16 @@ from typing import Optional, Tuple, Dict, Any, List
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldprice.sqlite")
 CURRENCY = "USD"
 TIMEFRAME = "1m"
+BOT_INDICATORS_MODE = "native"  # set by ensure_bot_indicators_source()
 
 # Key level rule (user-defined)
 KEY_RESISTANCE = 4347.0
 
+
+# Money / sizing assumptions (override via environment variables)
+LOT_SIZE = float(os.getenv("LOT_SIZE", "0.3"))
+LEVERAGE = float(os.getenv("LEVERAGE", "300"))
+CONTRACT_OZ_PER_LOT = float(os.getenv("CONTRACT_OZ_PER_LOT", "100"))  # XAUUSD: 1 lot ~= 100 oz
 # Polling
 SLEEP_SECONDS = 2.0  # continuous loop cadence
 LOOKBACK_BARS_FOR_FAILED_BREAKOUT = 12
@@ -55,12 +61,12 @@ LOOKBACK_BARS_FOR_FAILED_BREAKOUT = 12
 MIN_SECONDS_BETWEEN_SIGNALS = 60  # don't emit multiple signals too quickly
 
 # Risk / target model (ATR-based; robust across regimes)
-TP1_ATR_MULT = 1.0
-TP2_ATR_MULT = 2.0
+TP1_ATR_MULT = 0.8
+TP2_ATR_MULT = 1.6
 SL_ATR_MULT = 1.0
 
 # "Chop around mid-band" filter thresholds
-CHOP_MAX_DISTANCE_TO_MID_ATR = 0.25  # within 0.25*ATR of mid-band is "mid chop"
+CHOP_MAX_DISTANCE_TO_MID_ATR = 0.20  # within 0.25*ATR of mid-band is "mid chop"
 CHOP_MAX_ABS_MACD_HIST = 0.02        # histogram too small => no momentum expansion
 
 # Prowl
@@ -75,6 +81,44 @@ PROWL_TIMEOUT = 15
 # ----------------------------
 def utc_now() -> str:
     return _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+def _pnl_price(direction: str, entry: float, exit_price: float) -> float:
+    direction = str(direction).upper()
+    return (exit_price - entry) if direction == "LONG" else (entry - exit_price)
+
+def _margin_usd(entry_price: float) -> float:
+    # PnL is independent of leverage; leverage only affects margin / ROI-on-margin.
+    notional = float(entry_price) * CONTRACT_OZ_PER_LOT * LOT_SIZE
+    return notional / LEVERAGE if LEVERAGE else 0.0
+
+def _trade_money_components(direction: str, entry: float, close_price: float, tp1_hit: int, tp1_price: Optional[float]) -> dict:
+    # Intended 50/50 model: TP1 closes 50%, runner 50% exits at close_price.
+    tp1_hit = int(tp1_hit or 0)
+    entry = float(entry)
+    close_price = float(close_price)
+    pnl_tp1_price = 0.0
+    runner_weight = 1.0
+    if tp1_hit and tp1_price is not None:
+        pnl_tp1_price = 0.5 * _pnl_price(direction, entry, float(tp1_price))
+        runner_weight = 0.5
+    pnl_runner_price = runner_weight * _pnl_price(direction, entry, close_price)
+    pnl_total_price = pnl_tp1_price + pnl_runner_price
+    scale = CONTRACT_OZ_PER_LOT * LOT_SIZE
+    pnl_tp1_usd = pnl_tp1_price * scale
+    pnl_runner_usd = pnl_runner_price * scale
+    pnl_total_usd = pnl_total_price * scale
+    m = _margin_usd(entry)
+    roi = (pnl_total_usd / m) if m else None
+    return {
+        "pnl_tp1_price": pnl_tp1_price,
+        "pnl_runner_price": pnl_runner_price,
+        "pnl_total_price": pnl_total_price,
+        "pnl_tp1_usd": pnl_tp1_usd,
+        "pnl_runner_usd": pnl_runner_usd,
+        "pnl_total_usd": pnl_total_usd,
+        "margin_usd_est": m,
+        "roi_on_margin": roi,
+    }
+
 
 
 
@@ -240,10 +284,237 @@ CREATE TABLE IF NOT EXISTS bot_stats (
   breakevens INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(currency, timeframe)
 );
+
+CREATE TABLE IF NOT EXISTS bot_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  position_id INTEGER NOT NULL UNIQUE,
+  direction TEXT NOT NULL,
+  entry_ts_ms INTEGER NOT NULL,
+  entry_price REAL NOT NULL,
+  tp1_hit INTEGER NOT NULL,
+  tp1_ts_ms INTEGER,
+  tp1_price REAL,
+  close_ts_ms INTEGER NOT NULL,
+  close_price REAL NOT NULL,
+  close_reason TEXT NOT NULL,
+  lot_size REAL NOT NULL,
+  contract_oz_per_lot REAL NOT NULL,
+  leverage REAL NOT NULL,
+  margin_usd_est REAL,
+  pnl_tp1_price REAL NOT NULL,
+  pnl_runner_price REAL NOT NULL,
+  pnl_total_price REAL NOT NULL,
+  pnl_tp1_usd REAL NOT NULL,
+  pnl_runner_usd REAL NOT NULL,
+  pnl_total_usd REAL NOT NULL,
+  roi_on_margin REAL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_trades_entry_ts ON bot_trades(entry_ts_ms);
+CREATE INDEX IF NOT EXISTS idx_bot_trades_close_ts ON bot_trades(close_ts_ms);
 """
 
 
+# ----------------------------
+# bot_indicators compatibility layer
+# ----------------------------
+def _has_table_or_view(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE (type='table' OR type='view') AND name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _sqlite_has_json1(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute("SELECT json_extract(?, '$.a')", ('{"a": 1}',)).fetchone()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _create_bot_indicators_view(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP VIEW IF EXISTS bot_indicators")
+    conn.execute(
+        """
+        CREATE VIEW bot_indicators AS
+        SELECT
+            currency,
+            timeframe,
+            CAST(strftime('%s', period_start_utc) AS INTEGER) * 1000 AS bar_start_ts_ms,
+            close,
+            COALESCE(ema20, json_extract(indicators_json,'$.ema20')) AS ema20,
+            COALESCE(json_extract(indicators_json,'$.ema50'), json_extract(indicators_json,'$.ema_50')) AS ema50,
+            COALESCE(rsi14, json_extract(indicators_json,'$.rsi14')) AS rsi14,
+            COALESCE(atr14, json_extract(indicators_json,'$.atr14')) AS atr14,
+            COALESCE(macd, json_extract(indicators_json,'$.macd')) AS macd,
+            COALESCE(macd_signal, json_extract(indicators_json,'$.macd_signal')) AS macd_signal,
+            COALESCE(macd_hist, json_extract(indicators_json,'$.macd_hist')) AS macd_hist,
+            COALESCE(bb_mid, json_extract(indicators_json,'$.bb_mid')) AS bb_mid,
+            COALESCE(bb_upper, json_extract(indicators_json,'$.bb_upper')) AS bb_upper,
+            COALESCE(bb_lower, json_extract(indicators_json,'$.bb_lower')) AS bb_lower,
+            created_at_utc
+        FROM ohlc_indicators
+        """
+    )
+
+
+def _create_bot_indicators_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_indicators (
+            currency TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            bar_start_ts_ms INTEGER NOT NULL,
+            close REAL,
+            ema20 REAL,
+            ema50 REAL,
+            rsi14 REAL,
+            atr14 REAL,
+            macd REAL,
+            macd_signal REAL,
+            macd_hist REAL,
+            bb_mid REAL,
+            bb_upper REAL,
+            bb_lower REAL,
+            created_at_utc TEXT,
+            PRIMARY KEY(currency, timeframe, bar_start_ts_ms)
+        );
+        """
+    )
+
+
+def _refresh_bot_indicators_from_ohlc_indicators(
+    conn: sqlite3.Connection, currency: str, timeframe: str, limit: int = 2000
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT period_start_utc, close, ema20, rsi14, atr14, macd, macd_signal, macd_hist, bb_mid, bb_upper, bb_lower,
+               indicators_json, created_at_utc
+        FROM ohlc_indicators
+        WHERE currency=? AND timeframe=?
+        ORDER BY period_start_utc DESC
+        LIMIT ?
+        """,
+        (currency, timeframe, int(limit)),
+    ).fetchall()
+
+    if not rows:
+        return
+
+    to_insert = []
+    for (
+        period_start_utc,
+        close,
+        ema20,
+        rsi14,
+        atr14,
+        macd,
+        macd_signal,
+        macd_hist,
+        bb_mid,
+        bb_upper,
+        bb_lower,
+        indicators_json,
+        created_at_utc,
+    ) in rows:
+        try:
+            p = str(period_start_utc).replace("Z", "+00:00")
+            dt_obj = _dt.datetime.fromisoformat(p)
+            bar_start_ts_ms = int(dt_obj.timestamp() * 1000)
+        except Exception:
+            continue
+
+        ema50 = None
+        try:
+            data = json.loads(indicators_json) if indicators_json else {}
+            ema50 = data.get("ema50", data.get("ema_50"))
+            if ema20 is None:
+                ema20 = data.get("ema20")
+            if rsi14 is None:
+                rsi14 = data.get("rsi14")
+            if atr14 is None:
+                atr14 = data.get("atr14")
+            if macd is None:
+                macd = data.get("macd")
+            if macd_signal is None:
+                macd_signal = data.get("macd_signal")
+            if macd_hist is None:
+                macd_hist = data.get("macd_hist")
+            if bb_mid is None:
+                bb_mid = data.get("bb_mid")
+            if bb_upper is None:
+                bb_upper = data.get("bb_upper")
+            if bb_lower is None:
+                bb_lower = data.get("bb_lower")
+        except Exception:
+            pass
+
+        to_insert.append(
+            (
+                currency,
+                timeframe,
+                bar_start_ts_ms,
+                close,
+                ema20,
+                ema50,
+                rsi14,
+                atr14,
+                macd,
+                macd_signal,
+                macd_hist,
+                bb_mid,
+                bb_upper,
+                bb_lower,
+                created_at_utc,
+            )
+        )
+
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO bot_indicators
+        (currency,timeframe,bar_start_ts_ms,close,ema20,ema50,rsi14,atr14,macd,macd_signal,macd_hist,bb_mid,bb_upper,bb_lower,created_at_utc)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        to_insert,
+    )
+
+
+def ensure_bot_indicators_source(conn: sqlite3.Connection, currency: str, timeframe: str) -> str:
+    if _has_table_or_view(conn, "bot_indicators"):
+        return "native"
+
+    if not _has_table(conn, "ohlc_indicators"):
+        print("[WARN] Missing 'bot_indicators' and 'ohlc_indicators'. Run indicatoren.py first.")
+        return "missing"
+
+    if _sqlite_has_json1(conn):
+        try:
+            _create_bot_indicators_view(conn)
+            print("[INFO] Created VIEW bot_indicators (backed by ohlc_indicators).")
+            return "view"
+        except sqlite3.Error as e:
+            print(f"[WARN] Could not create VIEW bot_indicators: {e}")
+
+    _create_bot_indicators_table(conn)
+    _refresh_bot_indicators_from_ohlc_indicators(conn, currency, timeframe, limit=2500)
+    print("[INFO] Created TABLE bot_indicators (fallback). Will refresh periodically.")
+    return "table_fallback"
+
+
 def connect_db(path: str) -> sqlite3.Connection:
+    global BOT_INDICATORS_MODE
     # Use a writable DB (creates a working copy if original is read-only)
     try:
         conn = open_writable_db(path)
@@ -256,7 +527,10 @@ def connect_db(path: str) -> sqlite3.Connection:
             "INSERT OR IGNORE INTO bot_last_signal(currency,timeframe,last_signal_bar_ts_ms) VALUES (?,?,?)",
             (CURRENCY, TIMEFRAME, 0),
         )
+
+        BOT_INDICATORS_MODE = ensure_bot_indicators_source(conn, CURRENCY, TIMEFRAME)
         return conn
+
     except sqlite3.OperationalError as e:
         # Fallback: if we hit a read-only error during initialization, force a copied DB.
         msg = str(e).lower()
@@ -276,16 +550,23 @@ def connect_db(path: str) -> sqlite3.Connection:
                 "INSERT OR IGNORE INTO bot_last_signal(currency,timeframe,last_signal_bar_ts_ms) VALUES (?,?,?)",
                 (CURRENCY, TIMEFRAME, 0),
             )
+
+            BOT_INDICATORS_MODE = ensure_bot_indicators_source(conn, CURRENCY, TIMEFRAME)
             print(f"[WARN] DB init required writes; working copy created: {rw_path}")
             return conn
         raise
-
 
 
 # ----------------------------
 # Data fetch
 # ----------------------------
 def fetch_latest_indicator_rows(conn: sqlite3.Connection, limit: int = 50) -> List[Dict[str, Any]]:
+    # If we're in fallback mode (no SQLite JSON1), refresh a small rolling window into bot_indicators.
+    if BOT_INDICATORS_MODE == "table_fallback":
+        try:
+            _refresh_bot_indicators_from_ohlc_indicators(conn, CURRENCY, TIMEFRAME, limit=max(int(limit) + 200, 500))
+        except Exception as e:
+            print(f"[WARN] Failed to refresh bot_indicators fallback table: {e}")
     rows = conn.execute(
         """
         SELECT bar_start_ts_ms, close, ema20, ema50, rsi14, atr14, macd, macd_signal, macd_hist,
@@ -655,6 +936,50 @@ def update_positions_with_candle(conn: sqlite3.Connection, candle: Dict[str, Any
                 continue
 
 
+def record_trade_from_position(conn: sqlite3.Connection, pid: int) -> None:
+    """Insert one realized trade row into bot_trades for a CLOSED position.
+    Safe to call multiple times (position_id is UNIQUE).
+    """
+    r = conn.execute(
+        """
+        SELECT created_at_utc,currency,timeframe,direction,entry_ts_ms,entry_price,
+               tp1_hit,tp1_ts_ms,tp1_price,closed_ts_ms,close_price,close_reason,status
+        FROM bot_positions WHERE id=?
+        """,
+        (int(pid),),
+    ).fetchone()
+    if not r:
+        return
+    (created_at_utc,currency,timeframe,direction,entry_ts_ms,entry_price,
+     tp1_hit,tp1_ts_ms,tp1_price,closed_ts_ms,close_price,close_reason,status) = r
+    if str(status).upper() != "CLOSED" or closed_ts_ms is None or close_price is None or close_reason is None:
+        return
+    comp = _trade_money_components(direction, float(entry_price), float(close_price), int(tp1_hit or 0), tp1_price)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO bot_trades(
+          created_at_utc,currency,timeframe,position_id,direction,entry_ts_ms,entry_price,
+          tp1_hit,tp1_ts_ms,tp1_price,close_ts_ms,close_price,close_reason,
+          lot_size,contract_oz_per_lot,leverage,margin_usd_est,
+          pnl_tp1_price,pnl_runner_price,pnl_total_price,
+          pnl_tp1_usd,pnl_runner_usd,pnl_total_usd,roi_on_margin
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+          str(created_at_utc), str(currency), str(timeframe), int(pid), str(direction).upper(),
+          int(entry_ts_ms), float(entry_price),
+          int(tp1_hit or 0), (int(tp1_ts_ms) if tp1_ts_ms is not None else None),
+          (float(tp1_price) if tp1_price is not None else None),
+          int(closed_ts_ms), float(close_price), str(close_reason),
+          float(LOT_SIZE), float(CONTRACT_OZ_PER_LOT), float(LEVERAGE),
+          (float(comp["margin_usd_est"]) if comp["margin_usd_est"] is not None else None),
+          float(comp["pnl_tp1_price"]), float(comp["pnl_runner_price"]), float(comp["pnl_total_price"]),
+          float(comp["pnl_tp1_usd"]), float(comp["pnl_runner_usd"]), float(comp["pnl_total_usd"]),
+          (float(comp["roi_on_margin"]) if comp["roi_on_margin"] is not None else None)
+        )
+    )
+
+
 def close_position(conn: sqlite3.Connection, pid: int, ts_ms: int, price: float, reason: str) -> None:
     # pnl_pct as relative to entry
     r = conn.execute("SELECT direction, entry_price FROM bot_positions WHERE id=?", (pid,)).fetchone()
@@ -681,6 +1006,7 @@ def close_position(conn: sqlite3.Connection, pid: int, ts_ms: int, price: float,
         """,
         (int(ts_ms), float(price), str(reason), float(pnl_pct), int(pid)),
     )
+    record_trade_from_position(conn, pid)
 
 
 # ----------------------------
@@ -699,9 +1025,72 @@ class BotRuntime:
 RUNTIME = BotRuntime()
 
 
+def close_open_positions_on_stop(conn: sqlite3.Connection) -> None:
+    # If the bot stops with an open position, mark it to last known close.
+    r = conn.execute(
+        """
+        SELECT close, CAST(strftime('%s', period_start_utc) AS INTEGER)*1000 AS ts_ms
+        FROM ohlc
+        WHERE currency=? AND timeframe=?
+        ORDER BY period_start_utc DESC
+        LIMIT 1
+        """,
+        (CURRENCY, TIMEFRAME),
+    ).fetchone()
+    if not r:
+        return
+    last_close, last_ts = float(r[0]), int(r[1])
+    pids = conn.execute(
+        "SELECT id FROM bot_positions WHERE status='OPEN' AND currency=? AND timeframe=?",
+        (CURRENCY, TIMEFRAME),
+    ).fetchall()
+    for (pid,) in pids:
+        close_position(conn, int(pid), last_ts, last_close, "BOT_STOP_MARK")
+
+def print_daily_report(conn: sqlite3.Connection, tz_name: str = "Europe/Amsterdam") -> None:
+    # Aggregate realized performance from bot_trades.
+    try:
+        import pandas as _pd
+        import pytz as _pytz
+    except Exception:
+        print("[REPORT] pandas/pytz not available; skipping report.")
+        return
+    rows = conn.execute(
+        """
+        SELECT entry_ts_ms, pnl_total_usd, pnl_tp1_usd, pnl_runner_usd
+        FROM bot_trades
+        WHERE currency=? AND timeframe=?
+        ORDER BY entry_ts_ms ASC
+        """,
+        (CURRENCY, TIMEFRAME),
+    ).fetchall()
+    if not rows:
+        print("[REPORT] No trades in bot_trades yet.")
+        return
+    tz = _pytz.timezone(tz_name)
+    df = _pd.DataFrame(rows, columns=["entry_ts_ms","pnl_total_usd","pnl_tp1_usd","pnl_runner_usd"])
+    df["entry_dt"] = _pd.to_datetime(df["entry_ts_ms"], unit="ms", utc=True).dt.tz_convert(tz)
+    df["day"] = df["entry_dt"].dt.strftime("%Y-%m-%d")
+    g = df.groupby("day").agg(
+        trades=("pnl_total_usd","count"),
+        wins=("pnl_total_usd", lambda s: int((s>0).sum())),
+        losses=("pnl_total_usd", lambda s: int((s<0).sum())),
+        breakeven=("pnl_total_usd", lambda s: int((s==0).sum())),
+        pnl_usd=("pnl_total_usd","sum"),
+        pnl_tp1_usd=("pnl_tp1_usd","sum"),
+        pnl_runner_usd=("pnl_runner_usd","sum"),
+    ).reset_index()
+    print("\n[REPORT] Daily performance (Amsterdam time)")
+    print(g.to_string(index=False))
+
 def on_exit():
     if RUNTIME.conn:
         try:
+            # Ensure we capture PnL even if the bot stops mid-trade
+            close_open_positions_on_stop(RUNTIME.conn)
+            # Print realized PnL summary (TP1 vs runner, wins/losses per day)
+            print_daily_report(RUNTIME.conn)
+            # Notify
             if RUNTIME.prowl_key:
                 try:
                     prowl_send(RUNTIME.prowl_key, PROWL_APPNAME, "Bot stopped", f"Stopped at {utc_now()}", priority=0)
@@ -724,6 +1113,24 @@ def main() -> int:
 
     conn = connect_db(DB_PATH)
     RUNTIME.conn = conn
+
+    # CLI shortcut: print performance report and exit
+    import sys
+    if "--report" in sys.argv:
+        print_daily_report(conn)
+        return 0
+
+    if "--migrate-trades" in sys.argv:
+        # Backfill bot_trades from historical bot_positions
+        pids = conn.execute(
+            "SELECT id FROM bot_positions WHERE status='CLOSED' AND currency=? AND timeframe=?",
+            (CURRENCY, TIMEFRAME),
+        ).fetchall()
+        for (pid,) in pids:
+            record_trade_from_position(conn, int(pid))
+        conn.commit()
+        print_daily_report(conn)
+        return 0
 
     # Prowl
     prowl_key = read_prowl_key()
